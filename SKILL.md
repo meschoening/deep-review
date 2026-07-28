@@ -5,51 +5,75 @@ description: Use when the user runs /deep-review or asks for a thorough, deep, d
 
 # Deep Review
 
-Repeatable, thorough code review. The same 9 dimensions every run (`DIMENSIONS.md`), every dimension reviewing the full scope. Findings come back as schema-validated structured output and a deterministic script renders the report, so consistency comes from the fixed dimension list and the fixed renderer — not from anyone's judgment on the day. This skill only reports: it never modifies code, and it never judges its own findings (verification is a downstream skill's job).
+Repeatable, thorough code review. The same 9 dimensions every run (`DIMENSIONS.md`), every dimension reviewing the full scope. Consistency comes from the fixed dimension list and from scripts that own every mechanical step — resolving scope, merging, sorting, counting, rendering — not from anyone's judgment on the day. Agents make exactly two judgments: what is wrong with the code, and which two findings are the same issue.
+
+This skill only reports. It never modifies code, and it never judges whether its own findings are correct — verification belongs to `fix-review`.
 
 ## Invocation
 
 `/deep-review [target]`
 
-| target               | meaning                                       |
-|----------------------|-----------------------------------------------|
-| (omitted) / `branch` | diff vs auto-detected base (main/master)      |
-| `staged`             | `git diff --cached`                           |
-| `pr <num>`           | the PR's diff — must be checked out locally   |
-| `all`                | entire repo                                   |
-| `<path>`             | a file or directory under the repo            |
+| target               | meaning                                        |
+|----------------------|------------------------------------------------|
+| (omitted) / `branch` | committed diff vs auto-detected base           |
+| `working`            | uncommitted work: worktree vs HEAD + untracked |
+| `staged`             | `git diff --cached`                            |
+| `pr <num>`           | the PR's diff — must be checked out locally    |
+| `all`                | entire repo                                    |
+| `<path>`             | a file or directory under the repo             |
 
-The skill directory is the directory containing this `SKILL.md`. Refer to it as `<skill_dir>` below.
+`<skill_dir>` below is the directory containing this `SKILL.md`. Use `python3`, falling back to `python` if it isn't on PATH.
 
 ## Workflow
 
-1. **Resolve scope.** Run `python3 <skill_dir>/scripts/scope.py <target> [args]` from the repo root. Parse the output: a header of `KEY=value` lines (`TARGET`, `SOURCE`, `BASE`, `DIFF_CMD`, `LOC`, `FILE_COUNT`), then a `FILES` section listing one path per line. Print one line to chat: `scope: 1247 LOC, 14 files`.
+1. **Resolve scope.** Run `python3 <skill_dir>/scripts/scope.py <target> [args]`. It prints one JSON object and creates the run's raw directory. Print one line to chat: `scope: <scope field>`. If it exits nonzero, surface its stderr and stop — in particular `pr <num>` fails unless local HEAD matches the PR head, and reviewing a PR against the wrong checkout is worse than not reviewing it.
 
-2. **Abort on empty or error.** If `LOC == 0` or `FILE_COUNT == 0`, abort with `no changes to review`. If the script errored, surface its message and stop — in particular, `pr <num>` errors unless the local HEAD matches the PR head commit (it tells the user to run `gh pr checkout <num>` first). Never silently dispatch on empty scope, and never review a PR against the wrong checkout.
+2. **Check before dispatching.**
+   - `fileCount == 0` → stop with `no changes to review`. If `dirty` is true, add: uncommitted work exists — offer `/deep-review working`.
+   - `oversized` is true → report `loc` and `fileCount` and ask the user to confirm or narrow the target before dispatching. Nine agents over a whole large repo is expensive and shallow.
+   - Any nonzero `skipped` counts → mention them in the scope line so nobody assumes coverage that didn't happen.
 
-3. **Gather workflow inputs.**
-   - Dimension names: `grep -E '^### ' <skill_dir>/DIMENSIONS.md | sed -E 's/^### [0-9]+\. //'`
-   - Timestamps: `date "+%Y-%m-%d %H:%M:%S"` (report header) and `date "+%Y-%m-%d-%H%M"` (file stamp).
-   - Slug: `branch`, `staged`, `pr-<num>`, `all`, or for paths replace `/` and `.` with `-` (e.g. `engine-cli-py`).
-   - `mkdir -p <repo_root>/.claude/reviews`; findings path is `<repo_root>/.claude/reviews/<stamp>-<slug>.findings.json`, report path the same with `.html`.
+3. **Run the review workflow.** Call the Workflow tool with `scriptPath: <skill_dir>/scripts/review-workflow.js` and `args` set to **scope.py's JSON object verbatim** — don't rebuild, trim, or re-key it. This skill instructing the call is the user's multi-agent opt-in. The script runs one agent per dimension (each writing its own raw findings file), retries any that fail, then one synthesis agent that writes a dedupe plan. Agents inherit the session model. Do not inline, edit, or re-derive the script.
 
-4. **Run the review workflow.** Call the Workflow tool with `scriptPath: <skill_dir>/scripts/review-workflow.js` and args `{ skillDir, repoRoot, source, scope, timestamp, dimensions, files, diffCmd, findingsPath }` — `files` is the `FILES` list verbatim, `scope` is the same one-liner printed in step 1, `diffCmd` is `DIFF_CMD` (empty string for `all`/path targets). This skill instructing the call is the user's multi-agent opt-in. The script dispatches one agent per dimension plus a synthesis agent that writes the findings JSON; all agents inherit the session model. Do not inline, edit, or re-derive the script, and do not review or merge findings yourself — the workflow doing it the same way each run is the point.
+   *If the Workflow tool is unavailable*, fan out the same work as parallel read-only Agent dispatches: one per dimension with the script's review prompt, then one synthesis dispatch. Same prompts, same output files.
 
-5. **Render.** Run `python3 <skill_dir>/scripts/render.py <findingsPath> -o <reportPath>`. The script sorts, numbers, counts, HTML-escapes, and lays out the report deterministically, then prints the severity counts.
+4. **Merge.** `python3 <skill_dir>/scripts/merge.py --raw-dir <rawDir> -o <findingsPath>`. It applies the plan, filters to scope, verifies each cited file:line, and detects which dimensions produced nothing. Run it even if the workflow reported `planWritten: false` or errored outright — whatever reached disk is still a review, and without a plan every raw finding passes through unmerged. Only give up if merge.py itself reports no raw files at all.
 
-6. **One-line chat summary.** Format: `Deep review complete: 2 critical, 5 high, 11 medium, 8 low, 3 nits → .claude/reviews/2026-05-06-1430-branch.html`, using render.py's counts. If any dimension agents failed, append `(agent failures: <names>)`. Do not paste findings into chat.
+5. **Render.** `python3 <skill_dir>/scripts/render.py <findingsPath> -o <reportPath>`.
+
+6. **One-line chat summary.** Use render.py's counts: `Deep review complete: 2 critical, 5 high, 11 medium, 8 low, 3 nits → .claude/reviews/2026-05-06-1430-branch.html`. Append `(agent failures: <names>)` from merge.py's `dimension agents with no output` line — that reflects what actually reached the report, which the workflow's own return value can't. Append `(unmerged — synthesis failed)` if merge.py ran without a plan. Do not paste findings into chat — the report is the deliverable.
 
 ## Constraints
 
-- **Strictly report.** Never edit code, open PRs, or modify the working tree. Even obvious-looking fixes — the user decides what to act on.
-- **Same dimensions every run.** Don't skip dimensions because "this PR doesn't seem to involve security" or "no tests touched". Consistency is the point. A dimension agent returns an empty findings list if there's genuinely nothing to flag.
-- **Don't consult prior reviews** in `.claude/reviews/` to seed findings. Do the work fresh each invocation.
-- **Don't merge, filter, or verify findings yourself.** The workflow's synthesis agent merges mechanically (dedupe, severity sanity-check, scope check) and nothing in this skill judges whether a finding is correct — verification belongs to a downstream skill.
-- **Don't add a custom dimension** because the diff "feels like it needs one". If a real gap exists, propose adding it to `DIMENSIONS.md` *after* the review — never mid-run.
+- **Strictly report.** Never edit code, open PRs, or modify the working tree.
+- **Same dimensions every run**, whatever the diff looks like. An agent with nothing to flag writes an empty findings array.
+- **Never hand-write or hand-edit** `plan.json`, the findings JSON, or the HTML. If a script rejects its input, fix the input or the script — don't route around it.
+- **Don't consult prior reviews** in `.claude/reviews/` to seed findings. Fresh every invocation.
+- If `.claude/reviews/` isn't gitignored, mention it once after the first run.
+
+## Red Flags — STOP
+
+- About to fix something you spotted, even a one-liner. → Report it. The user decides.
+- About to skip a dimension because "this diff has no security/tests/concurrency angle." → Run all 9. That judgment is the bias the fixed list exists to remove.
+- About to add, drop, or swap a dimension for this run. → Propose it for `DIMENSIONS.md` *after* the review.
+- About to drop, rewrite, or re-severity a finding yourself. → merge.py owns that, and it cannot drop on judgment by design.
+- About to summarize the findings in chat because "the user will want the gist." → One line, then the report path.
+
+## Common Mistakes
+
+| Rationalization | Reality |
+|---|---|
+| "This finding is obviously a false positive, I'll drop it" | You have not verified it either. Unverified in, unverified out — `fix-review` triages. |
+| "The diff is tiny, one agent covering everything is enough" | The dimension list is the product. A tiny diff just makes the run cheap. |
+| "I'll write the findings JSON myself, it's faster than fixing the plan" | Then the report reflects your judgment, not the review's. Every hand-written field is an untracked edit. |
+| "The synthesis agent failed, so the run is lost" | Run merge.py anyway. Raw findings are on disk; you lose deduplication, not findings. |
+| "Nine agents on `all` will be thorough" | Nine agents over a whole repo produce shallow coverage and a huge bill. Confirm or narrow first. |
+| "scope.py said 0 files but I can see changes" | You have uncommitted work, or the files are binary/oversized. Check `dirty` and `skipped`, don't dispatch on a scope you distrust. |
 
 ## Files
 
-- `DIMENSIONS.md` — the 9 dimension briefs and the severity/confidence taxonomy. Single source: workflow agents read it directly; nothing in the prompts duplicates it.
-- `scripts/scope.py` — resolves a target into LOC, file list, and the diff command; enforces the PR-checkout match.
-- `scripts/review-workflow.js` — the Workflow script: schema-validated dimension agents in parallel, then one synthesis agent that writes the findings JSON.
-- `scripts/render.py` — deterministic findings-JSON → HTML renderer; prints the severity counts for the chat summary.
+- `DIMENSIONS.md` — the 9 dimension briefs and the severity/confidence taxonomy. Single source: agents read it directly; nothing in the prompts duplicates it.
+- `scripts/scope.py` — target → workflow args JSON; owns timestamps, slugs, paths, the scope list, and binary/size filtering.
+- `scripts/review-workflow.js` — dimension agents in parallel (with one retry), then a synthesis agent that writes the dedupe plan.
+- `scripts/merge.py` — applies the plan deterministically; scope filter, dimension union, severity/confidence resolution, file:line verification.
+- `scripts/render.py` — findings JSON → HTML; sorts, numbers, counts, escapes, and prints the severity counts.

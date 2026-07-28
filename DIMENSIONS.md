@@ -12,6 +12,10 @@ The same 9 dimensions are checked on every `/deep-review` run. Dimension agents 
 
 Severity rates the impact assuming the finding is real. Confidence (`high` / `medium` / `low`, a separate field on every finding) rates how sure you are it is real. Hedge with confidence, never with severity — don't pad severity to seem useful, and don't downgrade it because you're unsure.
 
+## Repo standards
+
+Every dimension is checked against the repo's own written rules as well as the checklist below. Where the repo documents standards — `CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, style or architecture guides under `docs/` — read what bears on your dimension and hold the code to it. A violation of a rule the repo wrote down is a finding; a violation of your own taste is not.
+
 ## Dimensions
 
 ### 1. Correctness & edge cases
@@ -100,6 +104,7 @@ Checklist:
 - Functions doing one thing, or many; nesting / cyclomatic complexity reasonable?
 - Dead/unused code, commented-out blocks, or "TODO" left dangling?
 - New code consistent with neighboring style (formatting, idioms, error patterns)?
+- Conventions the repo documents for itself (CLAUDE.md, CONTRIBUTING.md, docs/ guides) followed?
 - Comments explain *why*, not *what*; no stale or misleading docs?
 
 ### 9. Dependencies & build hygiene

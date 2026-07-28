@@ -1,65 +1,49 @@
 // deep-review orchestration. Invoked by SKILL.md via Workflow({scriptPath, args}).
 //
-// args (all required, assembled by the dispatcher per SKILL.md):
-//   skillDir     absolute path to the deep-review skill directory
-//   repoRoot     absolute path to the repo under review
-//   source       human source string from scope.py (e.g. "branch diff vs origin/main")
-//   scope        one-line scope summary (e.g. "1247 LOC, 14 files")
-//   timestamp    "YYYY-MM-DD HH:MM:SS" local time (Date is unavailable in workflow scripts)
-//   dimensions   array of dimension names, grepped from DIMENSIONS.md headings
-//   files        array of repo-relative paths in scope (scope.py FILES section)
-//   diffCmd      command that shows the change under review; "" for non-diff targets
-//   findingsPath absolute path where the synthesis agent writes the findings JSON
-//   model        OPTIONAL, smoke-testing only: tier override (e.g. "sonnet") to exercise
-//                the pipeline cheaply. Real reviews omit it — agents inherit the session model.
+// args: pass scope.py's JSON output verbatim. The fields used here are
+//   repoRoot, skillDir, source, scope, diffCmd, dimensions, filesPath, rawDir
+// plus an optional `model` (smoke-testing only — a tier override to exercise the
+// pipeline cheaply). Real reviews omit it: every agent inherits the session model.
 //
-// No model overrides in real runs: every agent inherits the session model.
+// Findings never travel through this script. Each dimension agent writes its own
+// raw file and returns only a count; the synthesis agent reads those files and
+// writes a *plan* — which findings duplicate which — rather than a rewritten copy
+// of them. merge.py then assembles the report input deterministically. Nothing in
+// the pipeline retypes a finding's prose, so nothing can paraphrase or truncate it.
+//
 // Severity/confidence taxonomy and dimension briefs live ONLY in DIMENSIONS.md;
 // agents read that file themselves so nothing is duplicated here.
 
 export const meta = {
   name: 'deep-review',
-  description: 'Fixed-dimension review agents in parallel, then one synthesis agent merges findings mechanically',
+  description: 'Fixed-dimension review agents in parallel, then one synthesis agent plans the merge',
   phases: [
     { title: 'Review', detail: 'one agent per dimension, each over the full scope' },
-    { title: 'Synthesize', detail: 'dedupe + severity sanity-check, write findings JSON' },
+    { title: 'Retry', detail: 'one more attempt for any dimension that failed' },
+    { title: 'Synthesize', detail: 'read raw findings, write the dedupe plan' },
   ],
 }
 
-const FINDINGS_SCHEMA = {
+const REVIEW_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['dimension', 'findings'],
+  required: ['index', 'dimension', 'count', 'wrote'],
   properties: {
-    dimension: { type: 'string', description: 'the dimension you were assigned' },
-    findings: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['file', 'line', 'severity', 'confidence', 'dimension', 'description', 'suggestion'],
-        properties: {
-          file: { type: 'string', description: 'repo-relative path' },
-          line: { type: 'integer', minimum: 0, description: 'line in the current version of the file; 0 for a file-level finding' },
-          severity: { enum: ['critical', 'high', 'medium', 'low', 'nit'] },
-          confidence: { enum: ['high', 'medium', 'low'], description: 'how sure you are the finding is real' },
-          dimension: { type: 'string', description: 'dimension this finding belongs to — yours, unless reporting a cross-dimension find' },
-          description: { type: 'string', description: '1-2 sentences, plain prose, no markup' },
-          suggestion: { type: 'string', description: 'concrete fix, plain prose, no markup' },
-        },
-      },
-    },
+    index: { type: 'integer', description: 'your dimension number' },
+    dimension: { type: 'string', description: 'your dimension name' },
+    count: { type: 'integer', minimum: 0, description: 'findings in the file you wrote' },
+    wrote: { type: 'string', description: 'absolute path of the raw findings file you wrote' },
   },
 }
 
-const SYNTH_SCHEMA = {
+const PLAN_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['total', 'merged', 'droppedOutOfScope'],
+  required: ['groups', 'duplicatesMerged'],
   properties: {
-    total: { type: 'integer', description: 'findings written to the JSON file' },
-    merged: { type: 'integer', description: 'raw findings merged away as duplicates' },
-    droppedOutOfScope: { type: 'integer', description: 'findings dropped because their file was not in scope' },
+    groups: { type: 'integer', minimum: 0, description: 'groups written to plan.json' },
+    duplicatesMerged: { type: 'integer', minimum: 0, description: 'findings folded into a keeper' },
+    severityOverrides: { type: 'integer', minimum: 0, description: 'severities corrected against the taxonomy' },
   },
 }
 
@@ -68,91 +52,117 @@ if (typeof a === 'string') {
   // Dispatchers sometimes pass args JSON-encoded; tolerate both forms.
   try { a = JSON.parse(a) } catch (e) { throw new Error('deep-review workflow: args arrived as an unparseable string') }
 }
-const missing = ['skillDir', 'repoRoot', 'source', 'scope', 'timestamp', 'dimensions', 'files', 'findingsPath']
+const missing = ['repoRoot', 'skillDir', 'source', 'scope', 'dimensions', 'filesPath', 'rawDir']
   .filter((k) => a == null || a[k] == null || a[k] === '')
 if (missing.length) throw new Error(`deep-review workflow: missing args: ${missing.join(', ')}`)
 if (!Array.isArray(a.dimensions) || !a.dimensions.length) throw new Error('deep-review workflow: args.dimensions must be a non-empty array')
-if (!Array.isArray(a.files) || !a.files.length) throw new Error('deep-review workflow: args.files must be a non-empty array')
 
 const modelOpt = a.model ? { model: a.model } : {}
-const fileList = a.files.join('\n')
+const pad = (n) => String(n).padStart(2, '0')
 const diffNote = a.diffCmd
-  ? `This is a diff-based review. See what changed with:\n  ${a.diffCmd}\nFindings must target lines that exist in the current version of each file. Read surrounding context — bugs often live just outside the diff.`
+  ? `This is a diff-based review. See what changed with:\n  ${a.diffCmd}\nFindings must cite lines that exist in the current version of each file. Read the surrounding code too — bugs often live just outside the diff.`
   : 'This is a full review of the files in scope, not a diff.'
 
-phase('Review')
-const reviews = await parallel(a.dimensions.map((dim) => () =>
-  agent(
-    `You are a code reviewer focused on ONE dimension: ${dim}.
+const reviewPrompt = (dim, i) => `You are a code reviewer focused on ONE dimension: ${dim}.
 
 Working directory: ${a.repoRoot}
 Scope: ${a.scope}. Source: ${a.source}.
-
-Files in scope:
-${fileList}
+The files in scope are listed one per line in ${a.filesPath} — read that file first. Review every file it lists.
 
 ${diffNote}
 
-First read ${a.skillDir}/DIMENSIONS.md. Its "Severity taxonomy" section defines the severity levels and the confidence field — apply them exactly. Your brief is the numbered section "${dim}": apply its checklist to every file in scope.
+Read ${a.skillDir}/DIMENSIONS.md. Its "Severity taxonomy" section defines the severity levels and the confidence field — apply them exactly. Your brief is the numbered section "${i}. ${dim}": apply its checklist to every file in scope.
+
+If the repo documents its own standards (CLAUDE.md, AGENTS.md, CONTRIBUTING.md, docs/ style or architecture guides), read what is relevant and hold the code to those documented rules. A violation of the repo's own written convention is a real finding; your personal preference is not.
 
 Rules:
 - Severity rates the impact assuming the finding is real; confidence rates how sure you are it is real. Never downgrade severity to hedge — hedge with confidence.
-- If you find a real issue outside your dimension, report it anyway and set its dimension field to the dimension it belongs to (use the exact names from DIMENSIONS.md). Do not assume a parallel agent saw it.
+- If you find a real issue outside your dimension, report it anyway and set its dimension field to where it belongs (exact names from DIMENSIONS.md). Do not assume a parallel agent saw it.
 - Be specific: file, line, what is wrong, why it matters, and a concrete fix.
-- description and suggestion are plain prose — no markdown, no HTML, no backticks. Refer to symbols and paths as bare text; everything is escaped and rendered verbatim downstream.
-- Read-only review: do not modify any files or run state-changing commands.
-- If there is genuinely nothing to flag, return an empty findings array. Do not invent findings to fill quota.`,
-    { label: `review:${dim}`, phase: 'Review', schema: FINDINGS_SCHEMA, ...modelOpt },
-  )))
+- title, description and suggestion are plain prose — no markdown, no HTML, no backticks. Refer to symbols and paths as bare text; everything is escaped and rendered verbatim downstream.
+- Read-only review: do not modify any file under ${a.repoRoot} and do not run state-changing commands.
+- If there is genuinely nothing to flag, write an empty findings array. Do not invent findings to fill a quota.
 
-const ok = []
-const failures = []
-reviews.forEach((r, i) => {
-  if (r && Array.isArray(r.findings)) ok.push({ dimension: a.dimensions[i], findings: r.findings })
-  else failures.push(a.dimensions[i])
-})
-if (!ok.length) throw new Error('deep-review workflow: every dimension agent failed')
-const totalRaw = ok.reduce((n, r) => n + r.findings.length, 0)
-log(`${ok.length}/${a.dimensions.length} dimension agents returned, ${totalRaw} raw findings${failures.length ? ` (failed: ${failures.join(', ')})` : ''}`)
-
-phase('Synthesize')
-const synth = await agent(
-  `You are merging code-review findings from ${ok.length} parallel dimension agents into one findings file. You do not review code yourself, and you do NOT judge whether findings are correct — verification happens downstream, outside this workflow.
-
-Raw findings, grouped by reporting agent:
-
-${JSON.stringify({ agents: ok }, null, 1)}
-
-Files in scope (a finding about any other file is out of scope):
-${fileList}
-
-Read the "Severity taxonomy" section of ${a.skillDir}/DIMENSIONS.md before applying rule 2.
-
-Merge rules — mechanical only:
-1. Dedupe: findings that reference the same file and line and describe the same underlying issue (even from different agents) merge into ONE finding — union their dimension tags, keep the clearest description and suggestion, and keep the higher severity and higher confidence. Findings on the same line that flag genuinely distinct issues stay separate.
-2. Severity sanity-check: if a finding's severity plainly contradicts the taxonomy (e.g. a style preference marked critical), adjust it to the matching level. Do not otherwise second-guess severities.
-3. Scope check: drop findings whose file is not in the scope list above, and count how many you dropped.
-4. No judgment drops: never drop a finding because you think it is wrong, intentional, or unimportant.
-
-Then use the Write tool to write ${a.findingsPath} with exactly this JSON shape:
+Then use the Write tool to write ${a.rawDir}/${pad(i)}.json:
 
 {
-  "meta": {
-    "source": ${JSON.stringify(a.source)},
-    "generated": ${JSON.stringify(a.timestamp)},
-    "scope": ${JSON.stringify(a.scope)},
-    "dimensions": ${JSON.stringify(a.dimensions)},
-    "failures": ${JSON.stringify(failures)}
-  },
+  "index": ${i},
+  "dimension": ${JSON.stringify(dim)},
   "findings": [
-    { "file": "...", "line": 123, "severity": "...", "confidence": "...", "dimensions": ["..."], "description": "...", "suggestion": "..." }
+    {
+      "file": "repo-relative path",
+      "line": 123,
+      "severity": "critical|high|medium|low|nit",
+      "confidence": "high|medium|low",
+      "dimension": "which dimension this belongs to",
+      "title": "short noun phrase naming the problem, under 60 characters",
+      "description": "1-2 sentences",
+      "suggestion": "the concrete fix"
+    }
   ]
 }
 
-Copy the meta block verbatim as given. Every finding carries all seven fields, with dimensions as an array of one or more dimension names. Order does not matter — the renderer sorts. After writing the file, report your counts.`,
-  { label: 'synthesize', phase: 'Synthesize', schema: SYNTH_SCHEMA, ...modelOpt },
-)
-if (!synth) throw new Error('deep-review workflow: synthesis agent failed')
-log(`synthesis: ${synth.total} findings written (${synth.merged} merged as duplicates, ${synth.droppedOutOfScope} dropped as out-of-scope)`)
+Use line 0 for a finding about the file as a whole. This file is the only record of your findings — nothing downstream re-reads your reply — so write it before you return.`
 
-return { findingsPath: a.findingsPath, totalFindings: synth.total, agentFailures: failures }
+phase('Review')
+let results = await parallel(a.dimensions.map((dim, idx) => () =>
+  agent(reviewPrompt(dim, idx + 1), { label: `review:${dim}`, phase: 'Review', schema: REVIEW_SCHEMA, ...modelOpt })))
+
+const allIdx = () => [...a.dimensions.keys()]
+let failed = allIdx().filter((i) => !results[i] || typeof results[i].count !== 'number')
+if (failed.length) {
+  // One flake shouldn't permanently cost a dimension — the whole point is that
+  // every run covers all of them.
+  phase('Retry')
+  log(`retrying ${failed.length} failed dimension agent(s): ${failed.map((i) => a.dimensions[i]).join(', ')}`)
+  const retries = await parallel(failed.map((i) => () =>
+    agent(reviewPrompt(a.dimensions[i], i + 1), { label: `retry:${a.dimensions[i]}`, phase: 'Retry', schema: REVIEW_SCHEMA, ...modelOpt })))
+  failed.forEach((i, n) => { if (retries[n]) results[i] = retries[n] })
+  failed = allIdx().filter((i) => !results[i] || typeof results[i].count !== 'number')
+}
+
+const ok = allIdx().filter((i) => !failed.includes(i))
+if (!ok.length) throw new Error('deep-review workflow: every dimension agent failed')
+const failures = failed.map((i) => a.dimensions[i])
+const totalRaw = ok.reduce((n, i) => n + results[i].count, 0)
+log(`${ok.length}/${a.dimensions.length} dimension agents returned, ${totalRaw} raw findings${failures.length ? ` (failed: ${failures.join(', ')})` : ''}`)
+
+phase('Synthesize')
+const rawList = ok.map((i) => `  ${a.rawDir}/${pad(i + 1)}.json  — ${a.dimensions[i]} (${results[i].count} findings)`).join('\n')
+const plan = await agent(
+  `You are deduplicating code-review findings produced by ${ok.length} parallel dimension agents. You do not review code, you do not rewrite findings, and you do NOT judge whether a finding is correct — verification happens downstream, outside this workflow.
+
+Read these files:
+${rawList}
+
+Each holds {index, dimension, findings: [...]}. A finding's id is its file's index, then "#", then its 0-based position in that array — so the third finding in the file with index 4 is "4#2".
+
+Your only job is to decide which findings are the SAME issue reported by different agents, and to correct any severity that plainly contradicts the taxonomy. Read the "Severity taxonomy" section of ${a.skillDir}/DIMENSIONS.md first.
+
+Two findings are duplicates when they cite the same file and line AND describe the same underlying problem. Two distinct problems on one line are NOT duplicates. The same problem cited at slightly different lines IS a duplicate — pick whichever finding describes it best as the keeper.
+
+Use the Write tool to write ${a.rawDir}/plan.json:
+
+{
+  "groups": [
+    { "keep": "1#0", "duplicates": ["3#2", "7#1"] },
+    { "keep": "2#4", "duplicates": [], "severity": "nit" }
+  ]
+}
+
+- keep: the id of the clearest finding in the group; its title, description and suggestion become the merged finding's.
+- duplicates: ids folded into it. Every id appears at most once across the whole plan.
+- severity: OPTIONAL, only when the finding's own severity contradicts the taxonomy (a style preference marked critical, say). Omit it otherwise — severity, confidence and dimension tags are computed downstream.
+
+Only list a finding if it merges with another or needs a severity correction. Anything you omit is kept exactly as written, so an incomplete plan loses nothing. Never list a finding to make it disappear: you cannot drop findings, and out-of-scope files are filtered downstream.`,
+  { label: 'synthesize', phase: 'Synthesize', schema: PLAN_SCHEMA, ...modelOpt },
+)
+if (plan) log(`plan: ${plan.groups} groups, ${plan.duplicatesMerged} duplicates folded in`)
+else log('synthesis agent failed — merge.py will pass every raw finding through unmerged')
+
+return {
+  rawDir: a.rawDir,
+  planWritten: Boolean(plan),
+  rawFindings: totalRaw,
+  agentFailures: failures,
+}
