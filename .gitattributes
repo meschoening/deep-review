@@ -1,0 +1,6 @@
+# LF in the working tree on every platform, including Windows checkouts with
+# core.autocrlf=true. scripts/review-workflow.js is handed to the Workflow tool
+# by path, and the permission layer that reads it rejects CR as a hidden control
+# character — a CRLF checkout fails the run before any agent dispatches. macOS
+# and Linux already check out LF, so this is a no-op there.
+* text=auto eol=lf
